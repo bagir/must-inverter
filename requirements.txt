@@ -1,0 +1,21 @@
+# UPS Monitoring System - Production Dependencies
+# Core functionality
+pyserial==3.5
+requests==2.31.0
+
+# Optional: For better JSON handling
+ujson==5.8.0
+
+# Optional: For advanced logging
+structlog==23.1.0
+
+# Optional: For configuration management
+pydantic==2.4.2
+python-dotenv==1.0.0
+
+# Optional: For API documentation (if adding Swagger/OpenAPI)
+fastapi==0.104.1
+uvicorn==0.24.0
+
+# Optional: For metrics and monitoring
+prometheus-client==0.17.1
