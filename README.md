@@ -1,4 +1,4 @@
-# UPS Monitoring System
+# MUST EP 20 1000 UPS Monitoring System. Replacement for Solar Power Monitor
 
 A comprehensive UPS (Uninterruptible Power Supply) monitoring system with web interface and JSON API.
 
