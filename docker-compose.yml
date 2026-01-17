@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  ups-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ups-monitor
+    restart: unless-stopped
+    
+    # Serial device access
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    # Alternative: use privileged mode (less secure)
+    # privileged: true
+    
+    # Ports
+    ports:
+      - "8080:8080"
+    
+    # Volumes for config and logs
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/var/log/ups
+    
+    # Environment variables (alternative to config.yaml)
+    environment:
+      - UPS_SERIAL_PORT=/dev/ttyUSB0
+      # - MQTT_BROKER=mqtt.example.com
+      # - MQTT_PORT=1883
+      # - MQTT_TOPIC=ups/telemetry
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
