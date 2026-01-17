@@ -12,9 +12,60 @@ import signal
 import threading
 from datetime import datetime
 from dataclasses import dataclass, asdict
+from typing import Optional, List, Tuple
+from collections import namedtuple
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import socketserver
+from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+import paho.mqtt.client as mqtt
+import yaml
+import os
+import argparse
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Serial port configuration
+SERIAL_BAUDRATE = 9600
+SERIAL_TIMEOUT = 2
+
+# UPS wakeup commands
+WAKEUP_COMMANDS = [
+    "0103271000018f7b",
+    "05034e210001c2ac",
+    "06034e210001c29f",
+    "0a03753000019f72",
+]
+
+# UPS protocol commands
+UPS_COMMAND_MAIN_PARAMS = "0a037530001b1eb9"
+UPS_COMMAND_BATTERY = "0a037918000a5ded"
+
+# Timing constants
+WAKEUP_DELAY = 0.3
+COMMAND_DELAY = 0.5
+POST_WAKEUP_DELAY = 0.5
+CONNECTION_RETRY_DELAY = 10
+ERROR_RETRY_DELAY = 5
+
+# Telemetry value ranges (raw values from UPS)
+VOLTAGE_RANGE = (2200, 2300)  # 220-230V in raw units (divide by 10)
+FREQUENCY_RANGE = (490, 510)  # 49-51Hz in raw units (divide by 10)
+BATTERY_VOLTAGE_RANGE = (130, 140)  # 13-14V in raw units (divide by 10)
+BATTERY_LEVEL_RANGE = (95, 105)  # 95-105%
+LOAD_PERCENT_RANGE = (10, 20)  # 10-20%
+LOAD_POWER_RANGE = (130, 150)  # 130-150W
+TEMPERATURE_RANGE = (30, 40)  # 30-40°C
+
+# Alarm thresholds
+MIN_INPUT_VOLTAGE = 180
+MIN_BATTERY_LEVEL = 20
+MAX_TEMPERATURE = 40
+MAX_LOAD_PERCENT = 80
+
+# Status thresholds
+ONLINE_VOLTAGE_THRESHOLD = 200
 
 @dataclass
 class UPSTelemetry:
@@ -32,31 +83,66 @@ class UPSTelemetry:
     uptime: str = ""
 
 class UPSWebDaemon:
-    def __init__(self, port, web_port=8080, interval=30):
+    def __init__(self, port, web_port=8080, interval=30, 
+                 mqtt_broker=None, mqtt_port=1883, mqtt_topic="ups/telemetry",
+                 mqtt_username=None, mqtt_password=None,
+                 log_level=logging.INFO, log_file="/tmp/ups_web_daemon.log", log_console=True,
+                 max_errors=5):
         self.port = port
         self.web_port = web_port
         self.interval = interval
         self.ser = None
         self.running = True
         self.connection_errors = 0
-        self.max_errors = 5
+        self.max_errors = max_errors
         self.current_telemetry = UPSTelemetry()
         self.start_time = datetime.now()
+        
+        # MQTT configuration
+        self.mqtt_broker = mqtt_broker
+        self.mqtt_port = mqtt_port
+        self.mqtt_topic = mqtt_topic
+        self.mqtt_username = mqtt_username
+        self.mqtt_password = mqtt_password
+        self.mqtt_client = None
+        
+        # Prometheus metrics
+        self.prom_input_voltage = Gauge('ups_input_voltage', 'Input voltage in volts')
+        self.prom_output_voltage = Gauge('ups_output_voltage', 'Output voltage in volts')
+        self.prom_battery_voltage = Gauge('ups_battery_voltage', 'Battery voltage in volts')
+        self.prom_battery_level = Gauge('ups_battery_level', 'Battery level in percent', ['status'])
+        self.prom_load_percent = Gauge('ups_load_percent', 'Load percentage')
+        self.prom_load_power = Gauge('ups_load_power', 'Load power in watts')
+        self.prom_frequency = Gauge('ups_frequency', 'Frequency in Hz')
+        self.prom_input_frequency = Gauge('ups_input_frequency', 'Input frequency in Hz')
+        self.prom_temperature = Gauge('ups_temperature', 'Temperature in Celsius')
+        self.prom_status = Gauge('ups_status', 'UPS status (1=online, 0=battery)', ['status'])
+        
+        # Cache for status labels to avoid recreating
+        self._status_labels = {}
 
         # Настройка логирования
+        handlers = []
+        if log_console:
+            handlers.append(logging.StreamHandler(sys.stdout))
+        if log_file:
+            handlers.append(logging.FileHandler(log_file, mode='a'))
+        
         logging.basicConfig(
-            level=logging.INFO,
+            level=log_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler('/tmp/ups_web_daemon.log', mode='a')
-            ]
+            handlers=handlers,
+            force=True
         )
         self.logger = logging.getLogger('UPSWebDaemon')
 
         # Обработчик сигналов
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
+        
+        # Инициализация MQTT
+        if self.mqtt_broker:
+            self.init_mqtt()
 
     def signal_handler(self, signum, frame):
         """Обработчик сигналов для graceful shutdown"""
@@ -75,11 +161,11 @@ class UPSWebDaemon:
         try:
             self.ser = serial.Serial(
                 port=self.port,
-                baudrate=9600,
+                baudrate=SERIAL_BAUDRATE,
                 bytesize=8,
                 parity='N',
                 stopbits=1,
-                timeout=2
+                timeout=SERIAL_TIMEOUT
             )
             self.ser.dtr = True
             self.ser.rts = False
@@ -105,30 +191,93 @@ class UPSWebDaemon:
         if self.ser and self.ser.is_open:
             self.ser.close()
             self.logger.info("✅ Отключено от UPS")
+    
+    def init_mqtt(self):
+        """Инициализация MQTT клиента"""
+        try:
+            self.mqtt_client = mqtt.Client(client_id="ups_monitor")
+            
+            if self.mqtt_username and self.mqtt_password:
+                self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
+            
+            self.mqtt_client.on_connect = self.on_mqtt_connect
+            self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+            
+            self.mqtt_client.connect(self.mqtt_broker, self.mqtt_port, 60)
+            self.mqtt_client.loop_start()
+            self.logger.info(f"✅ MQTT клиент подключен к {self.mqtt_broker}:{self.mqtt_port}")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка подключения MQTT: {e}")
+            self.mqtt_client = None
+    
+    def on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback при подключении к MQTT брокеру"""
+        if rc == 0:
+            self.logger.info(f"✅ MQTT подключено успешно")
+        else:
+            self.logger.error(f"❌ MQTT подключение неудачно, код: {rc}")
+    
+    def on_mqtt_disconnect(self, client, userdata, rc):
+        """Callback при отключении от MQTT брокера"""
+        if rc != 0:
+            self.logger.warning(f"⚠️  Неожиданное отключение MQTT, код: {rc}")
+    
+    def publish_mqtt(self, telemetry):
+        """Публикация телеметрии в MQTT"""
+        if not self.mqtt_client:
+            return
+        
+        try:
+            payload = json.dumps(asdict(telemetry), ensure_ascii=False)
+            result = self.mqtt_client.publish(self.mqtt_topic, payload, qos=1)
+            
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                self.logger.debug(f"📤 MQTT: опубликовано в {self.mqtt_topic}")
+            else:
+                self.logger.warning(f"⚠️  MQTT: ошибка публикации, код: {result.rc}")
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка MQTT публикации: {e}")
+    
+    def update_prometheus_metrics(self, telemetry):
+        """Обновление метрик Prometheus"""
+        try:
+            self.prom_input_voltage.set(telemetry.input_voltage)
+            self.prom_output_voltage.set(telemetry.output_voltage)
+            self.prom_battery_voltage.set(telemetry.battery_voltage)
+            self.prom_battery_level.labels(status=telemetry.status).set(telemetry.battery_level)
+            self.prom_load_percent.set(telemetry.load_percent)
+            self.prom_load_power.set(telemetry.load_power)
+            self.prom_frequency.set(telemetry.frequency)
+            self.prom_input_frequency.set(telemetry.input_frequency)
+            self.prom_temperature.set(telemetry.temperature)
+            
+            # Status: 1 for online, 0 for battery
+            # Cache labels to avoid recreating
+            status_label = telemetry.status
+            if status_label not in self._status_labels:
+                self._status_labels[status_label] = self.prom_status.labels(status=status_label)
+            
+            status_value = 1.0 if telemetry.status == "online" else 0.0
+            self._status_labels[status_label].set(status_value)
+        except Exception as e:
+            self.logger.error(f"❌ Ошибка обновления Prometheus метрик: {e}")
 
     def wakeup_ups(self):
         """Пробуждение UPS"""
-        wakeup_commands = [
-            "0103271000018f7b",
-            "05034e210001c2ac",
-            "06034e210001c29f",
-            "0a03753000019f72",
-        ]
-
         self.logger.debug("Пробуждение UPS...")
 
-        for hex_cmd in wakeup_commands:
+        for hex_cmd in WAKEUP_COMMANDS:
             try:
                 cmd = bytes.fromhex(hex_cmd)
                 self.ser.write(cmd)
                 self.ser.flush()
-                time.sleep(0.3)
+                time.sleep(WAKEUP_DELAY)
                 self.ser.read(100)
             except Exception as e:
                 self.logger.warning(f"Ошибка при пробуждении: {e}")
                 return False
 
-        time.sleep(0.5)
+        time.sleep(POST_WAKEUP_DELAY)
         return True
 
     def send_command(self, hex_command, description=""):
@@ -162,46 +311,36 @@ class UPSWebDaemon:
         for i in range(0, len(payload) - 1, 2):
             values.append(struct.unpack_from('>H', payload, i)[0])
 
-        # Поиск значений в данных
-        for i, val in enumerate(values):
-            # Напряжение сети (220-230V)
-            if 2200 <= val <= 2300 and telemetry.input_voltage == 0:
+        # Parse values using range matching
+        for val in values:
+            # Input voltage (220-230V) - first occurrence
+            if VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.input_voltage == 0:
                 telemetry.input_voltage = val / 10.0
-
-            # Напряжение выхода (220-230V)
-            elif 2200 <= val <= 2300 and telemetry.input_voltage > 0:
+            # Output voltage (220-230V) - second occurrence
+            elif VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.input_voltage > 0:
                 telemetry.output_voltage = val / 10.0
-
-            # Частота (49-51Hz)
-            elif 490 <= val <= 510:
+            # Frequency (49-51Hz)
+            elif FREQUENCY_RANGE[0] <= val <= FREQUENCY_RANGE[1]:
                 telemetry.frequency = val / 10.0
                 telemetry.input_frequency = val / 10.0
-
-            # Напряжение батареи (13-14V)
-            elif 130 <= val <= 140:
+            # Battery voltage (13-14V)
+            elif BATTERY_VOLTAGE_RANGE[0] <= val <= BATTERY_VOLTAGE_RANGE[1]:
                 telemetry.battery_voltage = val / 10.0
-
-            # Уровень батареи (95-105%)
-            elif 95 <= val <= 105:
+            # Battery level (95-105%)
+            elif BATTERY_LEVEL_RANGE[0] <= val <= BATTERY_LEVEL_RANGE[1]:
                 telemetry.battery_level = val
-
-            # Процент нагрузки (10-20%)
-            elif 10 <= val <= 20:
+            # Load percentage (10-20%)
+            elif LOAD_PERCENT_RANGE[0] <= val <= LOAD_PERCENT_RANGE[1]:
                 telemetry.load_percent = val
-
-            # Мощность нагрузки (130-150W)
-            elif 130 <= val <= 150:
+            # Load power (130-150W)
+            elif LOAD_POWER_RANGE[0] <= val <= LOAD_POWER_RANGE[1]:
                 telemetry.load_power = val
-
-            # Температура (30-40°C)
-            elif 30 <= val <= 40:
+            # Temperature (30-40°C)
+            elif TEMPERATURE_RANGE[0] <= val <= TEMPERATURE_RANGE[1]:
                 telemetry.temperature = val
 
-        # Определение статуса на основе телеметрии
-        if telemetry.input_voltage > 200:
-            telemetry.status = "online"
-        else:
-            telemetry.status = "battery"
+        # Determine status based on input voltage
+        telemetry.status = "online" if telemetry.input_voltage > ONLINE_VOLTAGE_THRESHOLD else "battery"
 
         return telemetry
 
@@ -209,14 +348,14 @@ class UPSWebDaemon:
         """Получение полной телеметрии"""
         telemetry = UPSTelemetry()
 
-        # Основные параметры
-        response = self.send_command("0a037530001b1eb9", "основные параметры")
+        # Get main parameters
+        response = self.send_command(UPS_COMMAND_MAIN_PARAMS, "основные параметры")
         if response:
             telemetry = self.parse_telemetry(response)
 
-        # Если не получили данные, пробуем запрос батареи
+        # If battery data missing, try battery command
         if telemetry.battery_voltage == 0:
-            battery_response = self.send_command("0a037918000a5ded", "батарея")
+            battery_response = self.send_command(UPS_COMMAND_BATTERY, "батарея")
             if battery_response:
                 battery_telemetry = self.parse_telemetry(battery_response)
                 if battery_telemetry.battery_voltage > 0:
@@ -230,16 +369,16 @@ class UPSWebDaemon:
         """Проверка аварийных состояний"""
         alarms = []
 
-        if telemetry.input_voltage < 180:
+        if telemetry.input_voltage > 0 and telemetry.input_voltage < MIN_INPUT_VOLTAGE:
             alarms.append("Низкое напряжение сети")
 
-        if telemetry.battery_level < 20:
+        if telemetry.battery_level > 0 and telemetry.battery_level < MIN_BATTERY_LEVEL:
             alarms.append("Низкий заряд батареи")
 
-        if telemetry.temperature > 40:
+        if telemetry.temperature > 0 and telemetry.temperature > MAX_TEMPERATURE:
             alarms.append("Высокая температура")
 
-        if telemetry.load_percent > 80:
+        if telemetry.load_percent > 0 and telemetry.load_percent > MAX_LOAD_PERCENT:
             alarms.append("Высокая нагрузка")
 
         return alarms
@@ -250,18 +389,18 @@ class UPSWebDaemon:
 
         while self.running:
             try:
-                # Подключаемся если нужно
+                # Connect if needed
                 if not self.ser or not self.ser.is_open:
                     if not self.connect():
-                        self.logger.warning("Ожидание 10 секунд перед повторной попыткой...")
-                        time.sleep(10)
+                        self.logger.warning(f"Ожидание {CONNECTION_RETRY_DELAY} секунд перед повторной попыткой...")
+                        time.sleep(CONNECTION_RETRY_DELAY)
                         continue
 
-                # Пробуждение UPS
+                # Wake up UPS
                 if not self.wakeup_ups():
                     self.logger.error("Не удалось пробудить UPS, переподключаемся...")
                     self.disconnect()
-                    time.sleep(5)
+                    time.sleep(ERROR_RETRY_DELAY)
                     continue
 
                 # Получение телеметрии
@@ -270,6 +409,12 @@ class UPSWebDaemon:
                 # Обновление текущей телеметрии
                 if any([telemetry.input_voltage > 0, telemetry.battery_voltage > 0]):
                     self.current_telemetry = telemetry
+
+                    # Обновление Prometheus метрик
+                    self.update_prometheus_metrics(telemetry)
+
+                    # Публикация в MQTT
+                    self.publish_mqtt(telemetry)
 
                     # Логирование
                     self.logger.info(
@@ -295,9 +440,9 @@ class UPSWebDaemon:
                     time.sleep(1)
 
             except Exception as e:
-                self.logger.error(f"Ошибка в цикле мониторинга: {e}")
+                self.logger.error(f"Ошибка в цикле мониторинга: {e}", exc_info=True)
                 self.disconnect()
-                time.sleep(5)
+                time.sleep(ERROR_RETRY_DELAY)
 
 class UPSRequestHandler(BaseHTTPRequestHandler):
     """Обработчик HTTP запросов"""
@@ -343,6 +488,12 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
                 'timestamp': datetime.now().isoformat()
             }
             self.wfile.write(json.dumps(health).encode())
+
+        elif self.path == '/metrics':
+            self.send_response(200)
+            self.send_header('Content-type', CONTENT_TYPE_LATEST)
+            self.end_headers()
+            self.wfile.write(generate_latest())
 
         else:
             self.send_response(404)
@@ -551,6 +702,42 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
 </html>
 """
 
+def load_config(config_path=None):
+    """Загрузка конфигурации из YAML файла"""
+    if config_path is None:
+        # Попытка найти конфиг в стандартных местах
+        possible_paths = [
+            'config.yaml',
+            'config.yml',
+            os.path.expanduser('~/.ups_monitor/config.yaml'),
+            '/etc/ups_monitor/config.yaml'
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                config_path = path
+                break
+    
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
+            return config
+        except Exception as e:
+            print(f"⚠️  Ошибка чтения конфига {config_path}: {e}")
+            return {}
+    
+    return {}
+
+def get_config_value(config, *keys, default=None):
+    """Получение значения из вложенного словаря конфига"""
+    current = config
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return default
+    return current if current is not None else default
+
 def start_web_server(daemon, port=8080):
     """Запуск веб-сервера"""
     handler = lambda *args, **kwargs: UPSRequestHandler(*args, daemon=daemon, **kwargs)
@@ -561,6 +748,7 @@ def start_web_server(daemon, port=8080):
     daemon.logger.info("   - / : Веб-интерфейс")
     daemon.logger.info("   - /api/telemetry : JSON API")
     daemon.logger.info("   - /api/health : Health check")
+    daemon.logger.info("   - /metrics : Prometheus metrics")
 
     try:
         server.serve_forever()
@@ -570,38 +758,97 @@ def start_web_server(daemon, port=8080):
         server.server_close()
 
 def main():
-    if len(sys.argv) not in [2, 3, 4]:
-        print("Использование: python3 ups_web_daemon_fixed.py /dev/ttyUSB0 [web_port] [interval]")
-        print("Примеры:")
-        print("  python3 ups_web_daemon_fixed.py /dev/ttyUSB0")
-        print("  python3 ups_web_daemon_fixed.py /dev/ttyUSB0 8080")
-        print("  python3 ups_web_daemon_fixed.py /dev/ttyUSB0 8080 30")
+    parser = argparse.ArgumentParser(
+        description='UPS Monitoring Daemon with Web Interface, Prometheus metrics and MQTT support',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Примеры использования:
+  # С использованием конфиг-файла (рекомендуется)
+  python3 mustmon.py --config config.yaml
+  
+  # С параметрами командной строки
+  python3 mustmon.py /dev/ttyUSB0
+  python3 mustmon.py /dev/ttyUSB0 --web-port 9000
+  python3 mustmon.py /dev/ttyUSB0 --mqtt-broker mqtt.example.com
+  
+  # Комбинация конфиг-файла и параметров командной строки
+  python3 mustmon.py --config config.yaml --web-port 9000
+        """
+    )
+    
+    parser.add_argument('port', nargs='?', help='Serial port (e.g., /dev/ttyUSB0)')
+    parser.add_argument('--config', '-c', help='Path to configuration file (YAML)')
+    parser.add_argument('--web-port', type=int, help='Web server port')
+    parser.add_argument('--interval', type=int, help='Polling interval in seconds')
+    parser.add_argument('--mqtt-broker', help='MQTT broker address')
+    parser.add_argument('--mqtt-port', type=int, help='MQTT broker port')
+    parser.add_argument('--mqtt-topic', help='MQTT topic')
+    parser.add_argument('--mqtt-username', help='MQTT username')
+    parser.add_argument('--mqtt-password', help='MQTT password')
+    
+    args = parser.parse_args()
+    
+    # Загрузка конфига
+    config = load_config(args.config)
+    
+    # Приоритет: CLI аргументы > конфиг > значения по умолчанию
+    port = args.port or get_config_value(config, 'serial', 'port')
+    if not port:
+        print("❌ Порт не указан! Используйте --config или укажите порт как аргумент")
+        parser.print_help()
         sys.exit(1)
-
-    port = sys.argv[1]
-    web_port = 8080
-    interval = 30
-
-    if len(sys.argv) >= 3:
-        web_port = int(sys.argv[2])
-    if len(sys.argv) >= 4:
-        interval = int(sys.argv[3])
+    
+    web_port = args.web_port or get_config_value(config, 'web', 'port', default=8080)
+    interval = args.interval or get_config_value(config, 'monitoring', 'interval', default=30)
+    max_errors = get_config_value(config, 'monitoring', 'max_errors', default=5)
+    
+    # MQTT настройки
+    mqtt_enabled = get_config_value(config, 'mqtt', 'enabled', default=False)
+    # Если broker указан в CLI или конфиге, используем его (CLI имеет приоритет)
+    mqtt_broker = args.mqtt_broker
+    if not mqtt_broker and mqtt_enabled:
+        mqtt_broker = get_config_value(config, 'mqtt', 'broker', default='localhost')
+    elif not mqtt_broker:
+        # Проверяем, есть ли broker в конфиге даже если enabled=False
+        mqtt_broker = get_config_value(config, 'mqtt', 'broker')
+    
+    mqtt_port = args.mqtt_port or get_config_value(config, 'mqtt', 'port', default=1883)
+    mqtt_topic = args.mqtt_topic or get_config_value(config, 'mqtt', 'topic', default='ups/telemetry')
+    mqtt_username = args.mqtt_username or get_config_value(config, 'mqtt', 'username')
+    mqtt_password = args.mqtt_password or get_config_value(config, 'mqtt', 'password')
+    
+    # Настройки логирования
+    log_level_str = get_config_value(config, 'logging', 'level', default='INFO')
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    log_file = get_config_value(config, 'logging', 'file', default='/tmp/ups_web_daemon.log')
+    log_console = get_config_value(config, 'logging', 'console', default=True)
 
     # Проверка доступности порта
-    import os
     if not os.path.exists(port):
         print(f"❌ Порт {port} не существует")
         sys.exit(1)
 
     print(f"🔌 UPS Web Monitoring Daemon")
+    if args.config or config:
+        config_used = args.config if args.config else 'config.yaml (auto-detected)'
+        print(f"   Config file: {config_used}")
     print(f"   Serial port: {port}")
     print(f"   Web interface: http://0.0.0.0:{web_port}")
     print(f"   Polling interval: {interval} сек")
-    print(f"   Log file: /tmp/ups_web_daemon.log")
+    if mqtt_broker:
+        print(f"   MQTT broker: {mqtt_broker}:{mqtt_port}")
+        print(f"   MQTT topic: {mqtt_topic}")
+    else:
+        print(f"   MQTT: disabled")
+    print(f"   Log level: {log_level_str}")
+    print(f"   Log file: {log_file}")
     print("=" * 50)
 
     # Запуск демона
-    daemon = UPSWebDaemon(port, web_port, interval)
+    daemon = UPSWebDaemon(port, web_port, interval, 
+                         mqtt_broker, mqtt_port, mqtt_topic,
+                         mqtt_username, mqtt_password,
+                         log_level, log_file, log_console, max_errors)
 
     # Запуск мониторинга в отдельном потоке
     monitor_thread = threading.Thread(target=daemon.monitoring_loop, daemon=True)
@@ -611,6 +858,9 @@ def main():
     start_web_server(daemon, web_port)
 
     # Завершение работы
+    if daemon.mqtt_client:
+        daemon.mqtt_client.loop_stop()
+        daemon.mqtt_client.disconnect()
     daemon.disconnect()
     daemon.logger.info("👋 UPS Web Daemon завершил работу")
 

@@ -12,6 +12,7 @@ structlog==23.1.0
 # Optional: For configuration management
 pydantic==2.4.2
 python-dotenv==1.0.0
+PyYAML==6.0.1
 
 # Optional: For API documentation (if adding Swagger/OpenAPI)
 fastapi==0.104.1
@@ -19,3 +20,6 @@ uvicorn==0.24.0
 
 # Optional: For metrics and monitoring
 prometheus-client==0.17.1
+
+# Optional: For MQTT integration
+paho-mqtt==1.6.1

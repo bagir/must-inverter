@@ -1,0 +1,43 @@
+# UPS Monitoring System Configuration File
+# Copy this file to config.yaml and customize as needed
+
+# Serial port configuration
+serial:
+  port: /dev/ttyUSB0
+  # Optional: baudrate (default: 9600)
+  # baudrate: 9600
+
+# Web server configuration
+web:
+  port: 8080
+  # Host to bind to (default: 0.0.0.0)
+  # host: 0.0.0.0
+
+# Monitoring configuration
+monitoring:
+  # Polling interval in seconds (default: 30)
+  interval: 30
+  # Maximum connection errors before shutdown (default: 5)
+  max_errors: 5
+
+# MQTT configuration (optional)
+mqtt:
+  # Set to true to enable MQTT
+  enabled: false
+  broker: localhost
+  port: 1883
+  topic: ups/telemetry
+  # Optional: username and password for authentication
+  # username: mqtt_user
+  # password: mqtt_password
+  # Optional: client ID (default: ups_monitor)
+  # client_id: ups_monitor
+
+# Logging configuration
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
+  level: INFO
+  # Log file path (default: /tmp/ups_web_daemon.log)
+  file: /tmp/ups_web_daemon.log
+  # Enable console logging (default: true)
+  console: true
