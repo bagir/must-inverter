@@ -22,6 +22,14 @@ import yaml
 import os
 import argparse
 
+# Experimental Modbus parser (optional)
+try:
+    from ups_modbus_parser import parse_telemetry_modbus, UPSTelemetryModbus
+    MODBUS_PARSER_AVAILABLE = True
+except ImportError:
+    MODBUS_PARSER_AVAILABLE = False
+    UPSTelemetryModbus = None
+
 # ============================================================================
 # Constants
 # ============================================================================
@@ -87,7 +95,7 @@ class UPSWebDaemon:
                  mqtt_broker=None, mqtt_port=1883, mqtt_topic="ups/telemetry",
                  mqtt_username=None, mqtt_password=None,
                  log_level=logging.INFO, log_file="/tmp/ups_web_daemon.log", log_console=True,
-                 max_errors=5):
+                 max_errors=5, use_modbus_parser=False):
         self.port = port
         self.web_port = web_port
         self.interval = interval
@@ -97,6 +105,7 @@ class UPSWebDaemon:
         self.max_errors = max_errors
         self.current_telemetry = UPSTelemetry()
         self.start_time = datetime.now()
+        self.web_server = None  # Will be set by start_web_server
         
         # MQTT configuration
         self.mqtt_broker = mqtt_broker
@@ -135,6 +144,15 @@ class UPSWebDaemon:
             force=True
         )
         self.logger = logging.getLogger('UPSWebDaemon')
+        
+        # Setup Modbus parser (after logger is initialized)
+        self.use_modbus_parser = use_modbus_parser and MODBUS_PARSER_AVAILABLE
+        
+        if use_modbus_parser and not MODBUS_PARSER_AVAILABLE:
+            self.logger.warning("⚠️  Modbus parser requested but not available. Using default parser.")
+            self.use_modbus_parser = False
+        elif use_modbus_parser:
+            self.logger.info("✅ Using experimental Modbus parser")
 
         # Обработчик сигналов
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -148,6 +166,14 @@ class UPSWebDaemon:
         """Обработчик сигналов для graceful shutdown"""
         self.logger.info(f"Получен сигнал {signum}, завершаем работу...")
         self.running = False
+        
+        # Stop web server if it exists
+        if self.web_server:
+            self.logger.info("Остановка веб-сервера...")
+            try:
+                self.web_server.shutdown()
+            except Exception as e:
+                self.logger.error(f"Ошибка при остановке веб-сервера: {e}")
 
     def get_uptime(self):
         """Получение времени работы демона"""
@@ -195,7 +221,17 @@ class UPSWebDaemon:
     def init_mqtt(self):
         """Инициализация MQTT клиента"""
         try:
-            self.mqtt_client = mqtt.Client(client_id="ups_monitor")
+            # Use callback API version 2 to avoid deprecation warning
+            try:
+                # paho-mqtt 2.0+ uses CallbackAPIVersion
+                from paho.mqtt.client import CallbackAPIVersion
+                self.mqtt_client = mqtt.Client(
+                    callback_api_version=CallbackAPIVersion.VERSION2,
+                    client_id="ups_monitor"
+                )
+            except (ImportError, AttributeError):
+                # Fallback for older versions
+                self.mqtt_client = mqtt.Client(client_id="ups_monitor")
             
             if self.mqtt_username and self.mqtt_password:
                 self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password)
@@ -210,15 +246,40 @@ class UPSWebDaemon:
             self.logger.error(f"❌ Ошибка подключения MQTT: {e}")
             self.mqtt_client = None
     
-    def on_mqtt_connect(self, client, userdata, flags, rc):
-        """Callback при подключении к MQTT брокеру"""
+    def on_mqtt_connect(self, client, userdata, flags, reason_code=None, properties=None):
+        """Callback при подключении к MQTT брокеру (API v2 compatible)"""
+        # Support both API v1 (rc in flags) and v2 (reason_code)
+        if reason_code is not None:
+            # API v2: reason_code is separate parameter
+            rc = reason_code
+        elif isinstance(flags, dict):
+            # API v2: flags is dict, check reason_code
+            rc = flags.get('reason_code', 0) if 'reason_code' in flags else 0
+        else:
+            # API v1: flags contains rc
+            rc = flags if isinstance(flags, int) else 0
+            
         if rc == 0:
             self.logger.info(f"✅ MQTT подключено успешно")
         else:
             self.logger.error(f"❌ MQTT подключение неудачно, код: {rc}")
     
-    def on_mqtt_disconnect(self, client, userdata, rc):
-        """Callback при отключении от MQTT брокера"""
+    def on_mqtt_disconnect(self, client, userdata, *args, **kwargs):
+        """Callback при отключении от MQTT брокера (API v1/v2 compatible)"""
+        # Handle different API versions:
+        # API v1: on_disconnect(client, userdata, rc)
+        # API v2: on_disconnect(client, userdata, rc, properties=None) 
+        #        or on_disconnect(client, userdata, rc, flags, properties)
+        rc = 0
+        
+        if args:
+            # First positional argument after client, userdata is usually rc/reason_code
+            rc = args[0] if isinstance(args[0], int) else 0
+        elif 'reason_code' in kwargs:
+            rc = kwargs['reason_code']
+        elif 'rc' in kwargs:
+            rc = kwargs['rc']
+            
         if rc != 0:
             self.logger.warning(f"⚠️  Неожиданное отключение MQTT, код: {rc}")
     
@@ -297,6 +358,14 @@ class UPSWebDaemon:
 
     def parse_telemetry(self, data):
         """Парсинг телеметрии из данных"""
+        # Use experimental Modbus parser if enabled
+        if self.use_modbus_parser:
+            return self._parse_telemetry_modbus(data)
+        else:
+            return self._parse_telemetry_legacy(data)
+    
+    def _parse_telemetry_legacy(self, data):
+        """Legacy parser using range matching"""
         telemetry = UPSTelemetry()
         telemetry.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         telemetry.uptime = self.get_uptime()
@@ -313,12 +382,12 @@ class UPSWebDaemon:
 
         # Parse values using range matching
         for val in values:
-            # Input voltage (220-230V) - first occurrence
-            if VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.input_voltage == 0:
-                telemetry.input_voltage = val / 10.0
-            # Output voltage (220-230V) - second occurrence
-            elif VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.input_voltage > 0:
+            # Output voltage (220-230V) - first occurrence (output comes first in UPS data)
+            if VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.output_voltage == 0:
                 telemetry.output_voltage = val / 10.0
+            # Input voltage (220-230V) - second occurrence (input comes second in UPS data)
+            elif VOLTAGE_RANGE[0] <= val <= VOLTAGE_RANGE[1] and telemetry.output_voltage > 0:
+                telemetry.input_voltage = val / 10.0
             # Frequency (49-51Hz)
             elif FREQUENCY_RANGE[0] <= val <= FREQUENCY_RANGE[1]:
                 telemetry.frequency = val / 10.0
@@ -343,6 +412,38 @@ class UPSWebDaemon:
         telemetry.status = "online" if telemetry.input_voltage > ONLINE_VOLTAGE_THRESHOLD else "battery"
 
         return telemetry
+    
+    def _parse_telemetry_modbus(self, data):
+        """Experimental Modbus-based parser"""
+        try:
+            modbus_telemetry = parse_telemetry_modbus(data, self.get_uptime())
+            
+            # Convert Modbus telemetry to standard structure
+            telemetry = UPSTelemetry()
+            telemetry.timestamp = modbus_telemetry.timestamp
+            telemetry.uptime = modbus_telemetry.uptime
+            telemetry.input_voltage = modbus_telemetry.input_voltage
+            telemetry.output_voltage = modbus_telemetry.output_voltage
+            telemetry.battery_voltage = modbus_telemetry.battery_voltage
+            telemetry.battery_level = modbus_telemetry.battery_level
+            telemetry.load_percent = modbus_telemetry.load_percent
+            telemetry.load_power = modbus_telemetry.load_power
+            telemetry.frequency = modbus_telemetry.frequency
+            telemetry.input_frequency = modbus_telemetry.input_frequency
+            telemetry.temperature = modbus_telemetry.temperature
+            telemetry.status = modbus_telemetry.status
+            
+            # Log extended values if available
+            if modbus_telemetry.error_message and modbus_telemetry.error_message != "No errors":
+                self.logger.warning(f"UPS Error: {modbus_telemetry.error_message}")
+            if modbus_telemetry.warning_message and modbus_telemetry.warning_message != "No errors":
+                self.logger.warning(f"UPS Warning: {modbus_telemetry.warning_message}")
+            
+            return telemetry
+        except Exception as e:
+            self.logger.error(f"❌ Error in Modbus parser: {e}", exc_info=True)
+            # Fallback to legacy parser
+            return self._parse_telemetry_legacy(data)
 
     def get_telemetry(self):
         """Получение полной телеметрии"""
@@ -454,51 +555,75 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         self.daemon.logger.info(f"WEB {self.address_string()} - {format % args}")
 
+    def _safe_write(self, data):
+        """Safely write data to client, handling connection errors gracefully"""
+        try:
+            if isinstance(data, str):
+                self.wfile.write(data.encode())
+            else:
+                self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # Client disconnected before we finished sending
+            # This is normal and not an error worth logging
+            self.daemon.logger.debug(f"Client disconnected during write: {type(e).__name__}")
+        except Exception as e:
+            self.daemon.logger.error(f"Unexpected error writing to client: {e}")
+
     def do_GET(self):
-        if self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
+        try:
+            if self.path == '/':
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
 
-            telemetry = self.daemon.current_telemetry
-            alarms = self.daemon.check_alarms(telemetry)
+                telemetry = self.daemon.current_telemetry
+                alarms = self.daemon.check_alarms(telemetry)
 
-            html = self.generate_html(telemetry, alarms)
-            self.wfile.write(html.encode())
+                html = self.generate_html(telemetry, alarms)
+                self._safe_write(html)
 
-        elif self.path == '/api/telemetry':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
+            elif self.path == '/api/telemetry':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
 
-            telemetry_dict = asdict(self.daemon.current_telemetry)
-            telemetry_dict['alarms'] = self.daemon.check_alarms(self.daemon.current_telemetry)
-            response = json.dumps(telemetry_dict, indent=2)
-            self.wfile.write(response.encode())
+                telemetry_dict = asdict(self.daemon.current_telemetry)
+                telemetry_dict['alarms'] = self.daemon.check_alarms(self.daemon.current_telemetry)
+                response = json.dumps(telemetry_dict, indent=2)
+                self._safe_write(response)
 
-        elif self.path == '/api/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
+            elif self.path == '/api/health':
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
 
-            health = {
-                'status': 'running',
-                'uptime': self.daemon.get_uptime(),
-                'timestamp': datetime.now().isoformat()
-            }
-            self.wfile.write(json.dumps(health).encode())
+                health = {
+                    'status': 'running',
+                    'uptime': self.daemon.get_uptime(),
+                    'timestamp': datetime.now().isoformat()
+                }
+                self._safe_write(json.dumps(health))
 
-        elif self.path == '/metrics':
-            self.send_response(200)
-            self.send_header('Content-type', CONTENT_TYPE_LATEST)
-            self.end_headers()
-            self.wfile.write(generate_latest())
+            elif self.path == '/metrics':
+                self.send_response(200)
+                self.send_header('Content-type', CONTENT_TYPE_LATEST)
+                self.end_headers()
+                self._safe_write(generate_latest())
 
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 Not Found')
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self._safe_write(b'404 Not Found')
+        except Exception as e:
+            self.daemon.logger.error(f"Error handling request {self.path}: {e}", exc_info=True)
+            try:
+                self.send_response(500)
+                self.end_headers()
+                self._safe_write(json.dumps({'error': 'Internal server error'}).encode())
+            except:
+                pass  # Client may have already disconnected
 
     def generate_html(self, telemetry, alarms):
         status_color = "green" if telemetry.status == "online" else "red"
@@ -739,9 +864,12 @@ def get_config_value(config, *keys, default=None):
     return current if current is not None else default
 
 def start_web_server(daemon, port=8080):
-    """Запуск веб-сервера"""
+    """Запуск веб-сервера в отдельном потоке"""
     handler = lambda *args, **kwargs: UPSRequestHandler(*args, daemon=daemon, **kwargs)
     server = HTTPServer(('0.0.0.0', port), handler)
+    
+    # Store server reference in daemon for shutdown
+    daemon.web_server = server
 
     daemon.logger.info(f"🌐 Веб-сервер запущен на http://0.0.0.0:{port}")
     daemon.logger.info("   Доступные endpoints:")
@@ -750,12 +878,22 @@ def start_web_server(daemon, port=8080):
     daemon.logger.info("   - /api/health : Health check")
     daemon.logger.info("   - /metrics : Prometheus metrics")
 
-    try:
-        server.serve_forever()
-    except Exception as e:
-        daemon.logger.error(f"Ошибка веб-сервера: {e}")
-    finally:
-        server.server_close()
+    def run_server():
+        """Запуск сервера в отдельном потоке"""
+        try:
+            server.serve_forever(poll_interval=1)
+        except Exception as e:
+            if daemon.running:  # Only log if we're still supposed to be running
+                daemon.logger.error(f"Ошибка веб-сервера: {e}")
+        finally:
+            daemon.logger.info("Веб-сервер остановлен")
+            server.server_close()
+    
+    # Start server in daemon thread
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+    
+    return server_thread
 
 def main():
     parser = argparse.ArgumentParser(
@@ -785,6 +923,8 @@ def main():
     parser.add_argument('--mqtt-topic', help='MQTT topic')
     parser.add_argument('--mqtt-username', help='MQTT username')
     parser.add_argument('--mqtt-password', help='MQTT password')
+    parser.add_argument('--use-modbus-parser', action='store_true', 
+                       help='Use experimental Modbus parser (requires ups_modbus_parser.py)')
     
     args = parser.parse_args()
     
@@ -822,6 +962,9 @@ def main():
     log_level = getattr(logging, log_level_str.upper(), logging.INFO)
     log_file = get_config_value(config, 'logging', 'file', default='/tmp/ups_web_daemon.log')
     log_console = get_config_value(config, 'logging', 'console', default=True)
+    
+    # Parser selection
+    use_modbus_parser = args.use_modbus_parser or get_config_value(config, 'monitoring', 'use_modbus_parser', default=False)
 
     # Проверка доступности порта
     if not os.path.exists(port):
@@ -848,21 +991,59 @@ def main():
     daemon = UPSWebDaemon(port, web_port, interval, 
                          mqtt_broker, mqtt_port, mqtt_topic,
                          mqtt_username, mqtt_password,
-                         log_level, log_file, log_console, max_errors)
+                         log_level, log_file, log_console, max_errors,
+                         use_modbus_parser)
 
     # Запуск мониторинга в отдельном потоке
     monitor_thread = threading.Thread(target=daemon.monitoring_loop, daemon=True)
     monitor_thread.start()
 
-    # Запуск веб-сервера в основном потоке
-    start_web_server(daemon, web_port)
-
-    # Завершение работы
-    if daemon.mqtt_client:
-        daemon.mqtt_client.loop_stop()
-        daemon.mqtt_client.disconnect()
-    daemon.disconnect()
-    daemon.logger.info("👋 UPS Web Daemon завершил работу")
+    # Запуск веб-сервера в отдельном потоке
+    server_thread = start_web_server(daemon, web_port)
+    
+    try:
+        # Основной поток ждет завершения или сигнала
+        while daemon.running:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        daemon.logger.info("Получен KeyboardInterrupt")
+        daemon.running = False
+    finally:
+        # Завершение работы
+        daemon.logger.info("Завершение работы демона...")
+        daemon.running = False
+        
+        # Stop web server (must be called from different thread)
+        if daemon.web_server:
+            daemon.logger.info("Остановка веб-сервера...")
+            try:
+                daemon.web_server.shutdown()
+            except Exception as e:
+                daemon.logger.error(f"Ошибка при остановке веб-сервера: {e}")
+        
+        # Wait for server thread to finish
+        if server_thread.is_alive():
+            daemon.logger.info("Ожидание завершения потока веб-сервера...")
+            server_thread.join(timeout=3)
+        
+        # Wait for monitor thread to finish (with timeout)
+        if monitor_thread.is_alive():
+            daemon.logger.info("Ожидание завершения потока мониторинга...")
+            monitor_thread.join(timeout=5)
+            if monitor_thread.is_alive():
+                daemon.logger.warning("Поток мониторинга не завершился в течение 5 секунд")
+        
+        # Cleanup MQTT
+        if daemon.mqtt_client:
+            try:
+                daemon.mqtt_client.loop_stop()
+                daemon.mqtt_client.disconnect()
+            except Exception as e:
+                daemon.logger.error(f"Ошибка при отключении MQTT: {e}")
+        
+        # Disconnect from UPS
+        daemon.disconnect()
+        daemon.logger.info("👋 UPS Web Daemon завершил работу")
 
 if __name__ == "__main__":
     main()
