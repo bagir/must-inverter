@@ -19,6 +19,8 @@ monitoring:
   interval: 30
   # Maximum connection errors before shutdown (default: 5)
   max_errors: 5
+  # Use experimental Modbus parser (default: false)
+  # use_modbus_parser: false
 
 # MQTT configuration (optional)
 mqtt:
