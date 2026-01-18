@@ -348,11 +348,70 @@ def parse_telemetry_modbus(data: bytes, uptime: str = "") -> UPSTelemetryModbus:
         if part3.get("RadiatorTemperature", 0) > 0:
             telemetry.temperature = part3.get("RadiatorTemperature", 0)
     
-    # Try battery status registers (address 113+)
-    registers_batt = convert_registers_to_dict(data, start_address=0)
-    if registers_batt:
-        battery_status = convert_battery_status(registers_batt)
+    # Direct register access from main response (addresses 0, 1, 2, ...)
+    # These are relative addresses after parsing the response
+    # Register addresses based on actual UPS data structure from scanner
+    registers_direct = convert_registers_to_dict(data, start_address=0)
+    
+    # Try battery status registers (address 113+) - reuse registers_direct
+    if registers_direct:
+        battery_status = convert_battery_status(registers_direct)
         if battery_status.get("StateOfCharge", 0) > 0:
             telemetry.battery_level = battery_status.get("StateOfCharge", 0)
+    if registers_direct:
+        # Register 4: Input voltage (входящее напряжение) - value/10 (e.g., 2240 -> 224.00V)
+        if 4 in registers_direct:
+            telemetry.input_voltage = registers_direct[4] / 10.0
+        
+        # Register 5: Input frequency (частота входа) - value/10 (e.g., 499 -> 49.90Hz)
+        if 5 in registers_direct:
+            telemetry.input_frequency = registers_direct[5] / 10.0
+            telemetry.frequency = registers_direct[5] / 10.0  # Also set main frequency
+        
+        # Register 6: Output voltage (выходящее напряжение) - value/10 (e.g., 2240 -> 224.00V)
+        if 6 in registers_direct:
+            telemetry.output_voltage = registers_direct[6] / 10.0
+        
+        # Register 7: Output frequency (частота выхода) - value/10 (e.g., 499 -> 49.90Hz)
+        if 7 in registers_direct:
+            # Output frequency, can be stored separately if needed
+            # For now, we'll use input_frequency for both
+            if telemetry.frequency == 0:
+                telemetry.frequency = registers_direct[7] / 10.0
+        
+        # Register 9: Load power in watts (нагрузка в ваттах)
+        # Value is directly in watts
+        # This has priority over register 10
+        if 9 in registers_direct:
+            load_power_raw = registers_direct[9]
+            telemetry.load_power = load_power_raw
+        # Register 10: Load power in VA (нагрузка в VA) - value/10 (e.g., 163 -> 16.3 VA)
+        # Only use if register 9 is not available
+        elif 10 in registers_direct:
+            load_va_raw = registers_direct[10]
+            telemetry.load_power = int(load_va_raw / 10.0)  # Store as VA in load_power field
+        
+        # Register 11: Load percentage (нагрузка в процентах) - direct value (e.g., 20 -> 20%)
+        if 11 in registers_direct:
+            load_pct_raw = registers_direct[11]
+            # Value is already in percent (0-100)
+            telemetry.load_percent = load_pct_raw
+        
+        # Register 13: Battery voltage (напряжение батареи) - value/10 (e.g., 136 -> 13.60V)
+        if 13 in registers_direct:
+            telemetry.battery_voltage = registers_direct[13] / 10.0
+        
+        # Register 16: Battery level (заряд батареи в процентах) - direct value (e.g., 100 -> 100%)
+        if 16 in registers_direct:
+            batt_level_raw = registers_direct[16]
+            # Value is already in percent (0-100)
+            telemetry.battery_level = batt_level_raw
+        
+        # Register 17: Temperature (температура) - direct value (e.g., 34 -> 34°C)
+        if 17 in registers_direct:
+            temp_raw = registers_direct[17]
+            # Temperature is typically 20-50°C, so use as is if reasonable
+            # If > 100, might need division, otherwise use directly
+            telemetry.temperature = temp_raw if temp_raw < 100 else temp_raw / 10.0
     
     return telemetry

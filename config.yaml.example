@@ -22,6 +22,18 @@ monitoring:
   # Use experimental Modbus parser (default: false)
   # use_modbus_parser: false
 
+# Battery calculation configuration
+battery:
+  # Nominal battery capacity in Ah (default: 55.0)
+  # Adjust this to match your UPS battery specifications
+  capacity_ah: 55.0
+  # Inverter efficiency (0.85-0.9, default: 0.88)
+  # Typical values: 0.85-0.90 for PWM inverters
+  inverter_efficiency: 0.88
+  # Peukert coefficient for AGM batteries (1.1-1.25, default: 1.15)
+  # Typical values: 1.15 for AGM, 1.25-1.3 for flooded lead-acid
+  peukert_k: 1.15
+
 # MQTT configuration (optional)
 mqtt:
   # Set to true to enable MQTT
