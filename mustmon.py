@@ -30,6 +30,13 @@ except ImportError:
     MODBUS_PARSER_AVAILABLE = False
     UPSTelemetryModbus = None
 
+# Battery calculator (optional)
+try:
+    from battery_calculator import estimate_ups_agm
+    BATTERY_CALCULATOR_AVAILABLE = True
+except ImportError:
+    BATTERY_CALCULATOR_AVAILABLE = False
+
 # ============================================================================
 # Constants
 # ============================================================================
@@ -89,13 +96,19 @@ class UPSTelemetry:
     timestamp: str = ""
     status: str = "unknown"
     uptime: str = ""
+    # Calculated battery values (from battery_calculator)
+    battery_soc_percent: float = 0.0  # Calculated SoC percentage
+    battery_current_a: float = 0.0    # Battery current (A)
+    battery_time_remaining_hours: float = 0.0  # Remaining runtime (hours)
+    battery_time_remaining_minutes: float = 0.0  # Remaining runtime (minutes)
 
 class UPSWebDaemon:
     def __init__(self, port, web_port=8080, interval=30, 
                  mqtt_broker=None, mqtt_port=1883, mqtt_topic="ups/telemetry",
                  mqtt_username=None, mqtt_password=None,
                  log_level=logging.INFO, log_file="/tmp/ups_web_daemon.log", log_console=True,
-                 max_errors=5, use_modbus_parser=False):
+                 max_errors=5, use_modbus_parser=False,
+                 battery_ah=55.0, inverter_eff=0.88, peukert_k=1.15):
         self.port = port
         self.web_port = web_port
         self.interval = interval
@@ -106,6 +119,12 @@ class UPSWebDaemon:
         self.current_telemetry = UPSTelemetry()
         self.start_time = datetime.now()
         self.web_server = None  # Will be set by start_web_server
+        
+        # Battery calculation parameters
+        self.battery_ah = battery_ah
+        self.inverter_eff = inverter_eff
+        self.peukert_k = peukert_k
+        self.use_battery_calculator = BATTERY_CALCULATOR_AVAILABLE
         
         # MQTT configuration
         self.mqtt_broker = mqtt_broker
@@ -120,15 +139,23 @@ class UPSWebDaemon:
         self.prom_output_voltage = Gauge('ups_output_voltage', 'Output voltage in volts')
         self.prom_battery_voltage = Gauge('ups_battery_voltage', 'Battery voltage in volts')
         self.prom_battery_level = Gauge('ups_battery_level', 'Battery level in percent', ['status'])
+        self.prom_battery_soc = Gauge('ups_battery_soc_percent', 'Battery SoC percentage (calculated)')
+        self.prom_battery_current = Gauge('ups_battery_current_amperes', 'Battery current in amperes')
+        self.prom_battery_time_remaining = Gauge('ups_battery_time_remaining_minutes', 'Battery remaining runtime in minutes')
         self.prom_load_percent = Gauge('ups_load_percent', 'Load percentage')
         self.prom_load_power = Gauge('ups_load_power', 'Load power in watts')
         self.prom_frequency = Gauge('ups_frequency', 'Frequency in Hz')
         self.prom_input_frequency = Gauge('ups_input_frequency', 'Input frequency in Hz')
         self.prom_temperature = Gauge('ups_temperature', 'Temperature in Celsius')
-        self.prom_status = Gauge('ups_status', 'UPS status (1=online, 0=battery)', ['status'])
+        self.prom_status = Gauge('ups_status_string', 'UPS status string (online/on battery)')
+        self.prom_warnings = Gauge('ups_recent_warnings_total', 'Total number of recent warnings')
         
         # Cache for status labels to avoid recreating
         self._status_labels = {}
+        
+        # Recent warnings storage (last 5)
+        self.recent_warnings = []  # List of dicts: {"timestamp": str, "message": str}
+        self.max_warnings = 5
 
         # Настройка логирования
         handlers = []
@@ -299,6 +326,50 @@ class UPSWebDaemon:
         except Exception as e:
             self.logger.error(f"❌ Ошибка MQTT публикации: {e}")
     
+    def calculate_battery_state(self, telemetry):
+        """Calculate battery SoC and remaining time using battery calculator"""
+        if not self.use_battery_calculator:
+            return
+        
+        # Determine if running on battery based on input voltage
+        # If input_voltage is 0 or below threshold, we're running on battery
+        is_on_battery = telemetry.input_voltage == 0 or telemetry.input_voltage < ONLINE_VOLTAGE_THRESHOLD
+        
+        # Always calculate if we have battery voltage and load power
+        if telemetry.battery_voltage > 0 and telemetry.load_power > 0:
+            try:
+                # Calculate battery current based on whether we're on battery or grid
+                if is_on_battery:
+                    # When on battery, calculate current from power and voltage
+                    battery_i = None  # Will be calculated by estimate_ups_agm
+                else:
+                    # When on grid, battery current is 0
+                    battery_i = 0.0
+                
+                result = estimate_ups_agm(
+                    power_w=float(telemetry.load_power),
+                    battery_v=telemetry.battery_voltage,
+                    battery_i=battery_i,  # 0 when on grid, calculated when on battery
+                    battery_ah=self.battery_ah,
+                    inverter_eff=self.inverter_eff,
+                    peukert_k=self.peukert_k,
+                    temperature_c=telemetry.temperature if telemetry.temperature > 0 else 25.0,
+                    battery_level_percent=float(telemetry.battery_level) if telemetry.battery_level > 0 else None
+                )
+                
+                # Update telemetry with calculated values (always calculate for display)
+                telemetry.battery_soc_percent = result['soc_percent']
+                telemetry.battery_current_a = result['current_a']  # Will be 0 if on grid
+                telemetry.battery_time_remaining_hours = result['time_hours']
+                telemetry.battery_time_remaining_minutes = result['time_minutes']
+                
+                # Also update battery_level with calculated SoC if it's better than direct value
+                if telemetry.battery_soc_percent > 0:
+                    telemetry.battery_level = int(telemetry.battery_soc_percent)
+                    
+            except Exception as e:
+                self.logger.debug(f"Ошибка расчета батареи: {e}")
+    
     def update_prometheus_metrics(self, telemetry):
         """Обновление метрик Prometheus"""
         try:
@@ -312,14 +383,20 @@ class UPSWebDaemon:
             self.prom_input_frequency.set(telemetry.input_frequency)
             self.prom_temperature.set(telemetry.temperature)
             
-            # Status: 1 for online, 0 for battery
-            # Cache labels to avoid recreating
-            status_label = telemetry.status
-            if status_label not in self._status_labels:
-                self._status_labels[status_label] = self.prom_status.labels(status=status_label)
+            # Battery calculated metrics
+            if telemetry.battery_soc_percent > 0:
+                self.prom_battery_soc.set(telemetry.battery_soc_percent)
+            if telemetry.battery_current_a > 0:
+                self.prom_battery_current.set(telemetry.battery_current_a)
+            if telemetry.battery_time_remaining_minutes > 0:
+                self.prom_battery_time_remaining.set(telemetry.battery_time_remaining_minutes)
             
-            status_value = 1.0 if telemetry.status == "online" else 0.0
-            self._status_labels[status_label].set(status_value)
+            # Status: simple string value
+            status_str = "online" if telemetry.status == "online" else "on battery"
+            self.prom_status.set(1.0 if status_str == "online" else 0.0)
+            
+            # Recent warnings count
+            self.prom_warnings.set(len(self.recent_warnings))
         except Exception as e:
             self.logger.error(f"❌ Ошибка обновления Prometheus метрик: {e}")
 
@@ -483,6 +560,14 @@ class UPSWebDaemon:
             alarms.append("Высокая нагрузка")
 
         return alarms
+    
+    def add_warning(self, message: str):
+        """Добавить warning в список последних предупреждений"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.recent_warnings.append({"timestamp": timestamp, "message": message})
+        # Оставляем только последние max_warnings
+        if len(self.recent_warnings) > self.max_warnings:
+            self.recent_warnings = self.recent_warnings[-self.max_warnings:]
 
     def monitoring_loop(self):
         """Цикл мониторинга UPS"""
@@ -509,6 +594,9 @@ class UPSWebDaemon:
 
                 # Обновление текущей телеметрии
                 if any([telemetry.input_voltage > 0, telemetry.battery_voltage > 0]):
+                    # Calculate battery state (SoC and remaining time)
+                    self.calculate_battery_state(telemetry)
+                    
                     self.current_telemetry = telemetry
 
                     # Обновление Prometheus метрик
@@ -518,21 +606,47 @@ class UPSWebDaemon:
                     self.publish_mqtt(telemetry)
 
                     # Логирование
-                    self.logger.info(
-                        f"Телеметрия: "
-                        f"Vin={telemetry.input_voltage:.1f}V, "
-                        f"Vout={telemetry.output_voltage:.1f}V, "
-                        f"Batt={telemetry.battery_voltage:.1f}V, "
-                        f"Load={telemetry.load_percent}%"
-                    )
+                    log_parts = [
+                        f"Vin={telemetry.input_voltage:.1f}V",
+                        f"Vout={telemetry.output_voltage:.1f}V",
+                        f"Batt={telemetry.battery_voltage:.1f}V",
+                        f"BattLevel={telemetry.battery_level}%",
+                        f"Load={telemetry.load_power}W",
+                        f"LoadPct={telemetry.load_percent}%",
+                        f"Freq={telemetry.frequency:.1f}Hz"
+                    ]
+                    
+                    if telemetry.temperature > 0:
+                        log_parts.append(f"Temp={telemetry.temperature:.1f}°C")
+                    
+                    if telemetry.battery_soc_percent > 0:
+                        log_parts.append(f"SoC={telemetry.battery_soc_percent:.1f}%")
+                    
+                    # Always show time remaining (will be 0 or calculated value)
+                    hours = int(telemetry.battery_time_remaining_hours)
+                    minutes = int(telemetry.battery_time_remaining_minutes % 60)
+                    log_parts.append(f"TimeRemaining={hours}h{minutes}m")
+                    
+                    # Always show battery current (will be 0 when on grid, calculated when on battery)
+                    log_parts.append(f"BattCurrent={telemetry.battery_current_a:.2f}A")
+                    
+                    self.logger.info(f"Телеметрия: {', '.join(log_parts)}")
 
                     # Проверка аварий
                     alarms = self.check_alarms(telemetry)
                     for alarm in alarms:
-                        self.logger.warning(f"Авария: {alarm}")
+                        warning_msg = f"Авария: {alarm}"
+                        self.logger.warning(warning_msg)
+                        self.add_warning(warning_msg)
 
                 else:
-                    self.logger.warning("Не удалось получить телеметрию")
+                    warning_msg = "Не удалось получить телеметрию"
+                    self.logger.warning(warning_msg)
+                    self.add_warning(warning_msg)
+                    # Переподключение при ошибке получения телеметрии
+                    self.logger.info("Переподключение к UPS...")
+                    self.disconnect()
+                    time.sleep(2)
 
                 # Ожидание до следующего опроса
                 for i in range(self.interval):
@@ -579,8 +693,9 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
 
                 telemetry = self.daemon.current_telemetry
                 alarms = self.daemon.check_alarms(telemetry)
+                warnings = self.daemon.recent_warnings
 
-                html = self.generate_html(telemetry, alarms)
+                html = self.generate_html(telemetry, alarms, warnings)
                 self._safe_write(html)
 
             elif self.path == '/api/telemetry':
@@ -591,6 +706,7 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
 
                 telemetry_dict = asdict(self.daemon.current_telemetry)
                 telemetry_dict['alarms'] = self.daemon.check_alarms(self.daemon.current_telemetry)
+                telemetry_dict['recent_warnings'] = self.daemon.recent_warnings
                 response = json.dumps(telemetry_dict, indent=2)
                 self._safe_write(response)
 
@@ -625,7 +741,7 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
             except:
                 pass  # Client may have already disconnected
 
-    def generate_html(self, telemetry, alarms):
+    def generate_html(self, telemetry, alarms, warnings):
         status_color = "green" if telemetry.status == "online" else "red"
         status_text = "ONLINE" if telemetry.status == "online" else "BATTERY"
 
@@ -704,6 +820,27 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
             border-radius: 10px;
             display: {'' if alarms else 'none'};
         }}
+        .warnings {{
+            background: #f39c12;
+            color: white;
+            padding: 15px;
+            margin: 20px;
+            border-radius: 10px;
+        }}
+        .warnings h3 {{
+            margin-top: 0;
+        }}
+        .warning-item {{
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.3);
+        }}
+        .warning-item:last-child {{
+            border-bottom: none;
+        }}
+        .warning-time {{
+            font-size: 0.85em;
+            opacity: 0.9;
+        }}
         .footer {{
             text-align: center;
             padding: 20px;
@@ -753,6 +890,8 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
         </div>
 
         {''.join(f'<div class="alarms">🚨 {alarm}</div>' for alarm in alarms)}
+        
+        {f'<div class="warnings"><h3>⚠️ Recent Warnings (Last {len(warnings)})</h3>' + ''.join(f'<div class="warning-item"><span class="warning-time">{w["timestamp"]}</span> - {w["message"]}</div>' for w in warnings) + '</div>' if warnings else ''}
 
         <div class="grid">
             <div class="card">
@@ -796,6 +935,14 @@ class UPSRequestHandler(BaseHTTPRequestHandler):
             <div class="card">
                 <h3>🌡️ Temperature</h3>
                 <div class="value">{telemetry.temperature:.1f}<span class="unit">°C</span></div>
+            </div>
+            
+            <div class="card" style="border-left: 4px solid #e74c3c;">
+                <h3>⏱️ Battery Runtime</h3>
+                <div class="value">{int(telemetry.battery_time_remaining_hours)}<span class="unit">h</span> {int(telemetry.battery_time_remaining_minutes % 60)}<span class="unit">m</span></div>
+                <div style="font-size: 0.9em; color: #7f8c8d; margin-top: 10px;">
+                    SoC: {telemetry.battery_soc_percent:.1f}% | Current: {telemetry.battery_current_a:.2f}A
+                </div>
             </div>
         </div>
 
@@ -965,6 +1112,11 @@ def main():
     
     # Parser selection
     use_modbus_parser = args.use_modbus_parser or get_config_value(config, 'monitoring', 'use_modbus_parser', default=False)
+    
+    # Battery calculation parameters
+    battery_ah = get_config_value(config, 'battery', 'capacity_ah', default=55.0)
+    inverter_eff = get_config_value(config, 'battery', 'inverter_efficiency', default=0.88)
+    peukert_k = get_config_value(config, 'battery', 'peukert_k', default=1.15)
 
     # Проверка доступности порта
     if not os.path.exists(port):
@@ -992,7 +1144,8 @@ def main():
                          mqtt_broker, mqtt_port, mqtt_topic,
                          mqtt_username, mqtt_password,
                          log_level, log_file, log_console, max_errors,
-                         use_modbus_parser)
+                         use_modbus_parser,
+                         battery_ah, inverter_eff, peukert_k)
 
     # Запуск мониторинга в отдельном потоке
     monitor_thread = threading.Thread(target=daemon.monitoring_loop, daemon=True)
